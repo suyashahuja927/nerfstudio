@@ -97,6 +97,10 @@ class SpacedSampler(Sampler):
         assert num_samples is not None
         num_rays = ray_bundle.origins.shape[0]
 
+        print("Ray bundle origins shape:", ray_bundle.origins.shape)
+        print("Ray bundle directions shape:", ray_bundle.directions.shape)
+        print("num_samples:", num_samples)
+
         bins = torch.linspace(0.0, 1.0, num_samples + 1).to(ray_bundle.origins.device)[None, ...]  # [1, num_samples+1]
 
         # TODO More complicated than it needs to be.
@@ -330,9 +334,9 @@ class PDFSampler(Sampler):
             u = u.expand(size=(*cdf.shape[:-1], num_bins))
         u = u.contiguous()
 
-        assert ray_samples.spacing_starts is not None and ray_samples.spacing_ends is not None, (
-            "ray_sample spacing_starts and spacing_ends must be provided"
-        )
+        assert (
+            ray_samples.spacing_starts is not None and ray_samples.spacing_ends is not None
+        ), "ray_sample spacing_starts and spacing_ends must be provided"
         assert ray_samples.spacing_to_euclidean_fn is not None, "ray_samples.spacing_to_euclidean_fn must be provided"
         existing_bins = torch.cat(
             [
@@ -607,6 +611,8 @@ class ProposalNetworkSampler(Sampler):
                 else:
                     with torch.no_grad():
                         density = density_fns[i_level](ray_samples.frustums.get_positions())
+                print(f"density shape in sampler: {density.shape}")
+
                 weights = ray_samples.get_weights(density)
                 weights_list.append(weights)  # (num_rays, num_samples)
                 ray_samples_list.append(ray_samples)

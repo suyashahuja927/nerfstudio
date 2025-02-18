@@ -50,6 +50,7 @@ class CameraType(Enum):
     VR180_R = auto()
     ORTHOPHOTO = auto()
     FISHEYE624 = auto()
+    OMNIDIRECTIONAL = auto()
 
 
 CAMERA_MODEL_TO_TYPE = {
@@ -66,6 +67,7 @@ CAMERA_MODEL_TO_TYPE = {
     "VR180_R": CameraType.VR180_R,
     "ORTHOPHOTO": CameraType.ORTHOPHOTO,
     "FISHEYE624": CameraType.FISHEYE624,
+    "OMNIDIRECTIONAL": CameraType.OMNIDIRECTIONAL
 }
 
 
@@ -101,6 +103,8 @@ class Cameras(TensorDataclass):
     camera_type: Int[Tensor, "*num_cameras 1"]
     times: Optional[Float[Tensor, "num_cameras 1"]]
     metadata: Optional[Dict]
+    xi: Optional[float] = None,
+    distortion_params_4: Optional[Float[Tensor, "*batch_dist_params 4"]] = None,
 
     def __init__(
         self,
@@ -109,6 +113,8 @@ class Cameras(TensorDataclass):
         fy: Union[Float[Tensor, "*batch_fys 1"], float],
         cx: Union[Float[Tensor, "*batch_cxs 1"], float],
         cy: Union[Float[Tensor, "*batch_cys 1"], float],
+        xi: Optional[float] = None,  # Mirror parameter for omnidirectional cameras
+        distortion_params_4: Optional[Float[Tensor, "*batch_dist_params 4"]] = None,  # 4 coefficients: k1, k2, p1, p2
         width: Optional[Union[Shaped[Tensor, "*batch_ws 1"], int]] = None,
         height: Optional[Union[Shaped[Tensor, "*batch_hs 1"], int]] = None,
         distortion_params: Optional[Float[Tensor, "*batch_dist_params 6"]] = None,
@@ -154,6 +160,10 @@ class Cameras(TensorDataclass):
         self.width = self._init_get_height_width(width, self.cx)
         self.camera_type = self._init_get_camera_type(camera_type)
         self.times = self._init_get_times(times)
+
+        #for omnidir maybe????
+        self.xi = xi if xi is not None else torch.tensor([0.0], device=self.device)  # Default to 0.0
+        self.distortion_params = distortion_params
 
         self.metadata = metadata
 
@@ -205,9 +215,9 @@ class Cameras(TensorDataclass):
         elif isinstance(camera_type, int):
             camera_type = torch.tensor([camera_type], device=self.device)
         elif isinstance(camera_type, torch.Tensor):
-            assert not torch.is_floating_point(camera_type), (
-                f"camera_type tensor must be of type int, not: {camera_type.dtype}"
-            )
+            assert not torch.is_floating_point(
+                camera_type
+            ), f"camera_type tensor must be of type int, not: {camera_type.dtype}"
             camera_type = camera_type.to(self.device)
             if camera_type.ndim == 0 or camera_type.shape[-1] != 1:
                 camera_type = camera_type.unsqueeze(-1)
@@ -377,6 +387,9 @@ class Cameras(TensorDataclass):
         Returns:
             Rays for the given camera indices and coords.
         """
+
+
+
         # Check the argument types to make sure they're valid and all shaped correctly
         assert isinstance(camera_indices, (torch.Tensor, int)), "camera_indices must be a tensor or int"
         assert coords is None or isinstance(coords, torch.Tensor), "coords must be a tensor or None"
@@ -400,14 +413,14 @@ class Cameras(TensorDataclass):
 
         # If the camera indices are an int, then we need to make sure that the camera batch is 1D
         if isinstance(camera_indices, int):
-            assert len(cameras.shape) == 1, (
-                "camera_indices must be a tensor if cameras are batched with more than 1 batch dimension"
-            )
+            assert (
+                len(cameras.shape) == 1
+            ), "camera_indices must be a tensor if cameras are batched with more than 1 batch dimension"
             camera_indices = torch.tensor([camera_indices], device=cameras.device)
 
-        assert camera_indices.shape[-1] == len(cameras.shape), (
-            "camera_indices must have shape (num_rays:..., num_cameras_batch_dims)"
-        )
+        assert camera_indices.shape[-1] == len(
+            cameras.shape
+        ), "camera_indices must have shape (num_rays:..., num_cameras_batch_dims)"
 
         # If keep_shape is True, then we need to make sure that the camera indices in question
         # are all the same height and width and can actually be batched while maintaining the image
@@ -463,10 +476,11 @@ class Cameras(TensorDataclass):
 
         # This will do the actual work of generating the rays now that we have standardized the inputs
         # raybundle.shape == (num_rays) when done
-
-        raybundle = cameras._generate_rays_from_coords(
-            camera_indices, coords, camera_opt_to_camera, distortion_params_delta, disable_distortion=disable_distortion
-        )
+        raybundle = cameras._generate_rays_omnidir(camera_indices, coords, distortion_params_delta,
+                                                       disable_distortion)
+        #    raybundle = cameras._generate_rays_from_coords(
+        #        camera_indices, coords, camera_opt_to_camera, distortion_params_delta, disable_distortion=disable_distortion
+        #)
 
         # If we have mandated that we don't keep the shape, then we flatten
         if keep_shape is False:
@@ -1021,3 +1035,112 @@ class Cameras(TensorDataclass):
             self.width = torch.ceil(self.width * scaling_factor).to(torch.int64)
         else:
             raise ValueError("Scale rounding mode must be 'floor', 'round' or 'ceil'.")
+
+    def sample_rays_omnidir(self, u, v):
+        # Compute the radial distortion
+        rd = torch.sqrt((u - self.cx) ** 2 + (v - self.cy) ** 2)
+        theta = torch.atan(rd / self.fx)
+
+        # Apply the CMei projection model
+        x = torch.sin(theta) * (u - self.cx) / rd
+        y = torch.sin(theta) * (v - self.cy) / rd
+        z = torch.cos(theta)
+
+        # Normalize ray directions
+        rays = torch.stack([x, y, z], dim=-1)
+        rays = rays / torch.norm(rays, dim=-1, keepdim=True)
+
+        return rays
+
+    def _generate_rays_omnidir(
+            self,
+            camera_indices: torch.Tensor,
+            coords: torch.Tensor,
+            distortion_params_delta: Optional[torch.Tensor] = None,
+            disable_distortion: bool = False,
+    ) -> RayBundle:
+        """
+        Generates rays for the omnidirectional camera model using CMei's equations.
+
+        Args:
+            camera_indices: Indices of the cameras.
+            coords: Pixel coordinates.
+            distortion_params_delta: Optional delta for distortion coefficients.
+            disable_distortion: If True, disable distortion correction.
+
+        Returns:
+            RayBundle containing origins, directions, and other ray information.
+        """
+        # Extract intrinsic and distortion parameters
+        fx = self.fx[camera_indices]
+        fy = self.fy[camera_indices]
+        cx = self.cx[camera_indices]
+        cy = self.cy[camera_indices]
+        xi = self.xi[camera_indices]
+        dist_params = self.distortion_params[camera_indices]
+
+        if distortion_params_delta is not None:
+            dist_params += distortion_params_delta
+
+        # Pixel coordinates to normalized device coordinates
+        u, v = coords[..., 0], coords[..., 1]
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+
+        # Compute radial distortion
+        r2 = x ** 2 + y ** 2
+        if not disable_distortion:
+            k1, k2, p1, p2 = dist_params[..., 0], dist_params[..., 1], dist_params[..., 2], dist_params[..., 3]
+            x_dist = x * (1 + k1 * r2 + k2 * r2 ** 2) + 2 * p1 * x * y + p2 * (r2 + 2 * x ** 2)
+            y_dist = y * (1 + k1 * r2 + k2 * r2 ** 2) + p1 * (r2 + 2 * y ** 2) + 2 * p2 * x * y
+        else:
+            x_dist, y_dist = x, y
+
+        # Apply mirror model with xi
+        r = torch.sqrt(x_dist ** 2 + y_dist ** 2 + 1)
+        directions = torch.stack([x_dist, y_dist, 1 - xi * r], dim=-1)
+
+        # Normalize directions
+        directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+
+        # Origins are at the camera's position
+        origins = self.camera_to_worlds[camera_indices, :3, 3]
+
+        # Apply rotation to directions
+        rotations = self.camera_to_worlds[camera_indices, :3, :3]
+        directions = torch.einsum("...ij,...bj->...bi", rotations, directions)
+
+        # Compute dx and dy for pixel area calculation
+        coord_x_offset = torch.stack([(u + 1 - cx) / fx, (v - cy) / fy], dim=-1)
+        coord_y_offset = torch.stack([(u - cx) / fx, (v + 1 - cy) / fy], dim=-1)
+
+        r_x_offset = torch.sqrt(coord_x_offset[..., 0] ** 2 + coord_x_offset[..., 1] ** 2 + 1)
+        r_y_offset = torch.sqrt(coord_y_offset[..., 0] ** 2 + coord_y_offset[..., 1] ** 2 + 1)
+
+        directions_x_offset = torch.stack(
+            [coord_x_offset[..., 0], coord_x_offset[..., 1], 1 - xi * r_x_offset], dim=-1
+        )
+        directions_y_offset = torch.stack(
+            [coord_y_offset[..., 0], coord_y_offset[..., 1], 1 - xi * r_y_offset], dim=-1
+        )
+
+        directions_x_offset = directions_x_offset / torch.norm(directions_x_offset, dim=-1, keepdim=True)
+        directions_y_offset = directions_y_offset / torch.norm(directions_y_offset, dim=-1, keepdim=True)
+
+        # Apply rotations to directions_x_offset and directions_y_offset
+        directions_x_offset = torch.einsum("...ij,...bj->...bi", rotations, directions_x_offset)
+        directions_y_offset = torch.einsum("...ij,...bj->...bi", rotations, directions_y_offset)
+
+        # Ensure shapes align
+        dx = torch.norm(directions - directions_x_offset, dim=-1)
+        dy = torch.norm(directions - directions_y_offset, dim=-1)
+
+        # Calculate pixel area
+        pixel_area = (dx * dy)[..., None]
+
+        # Return RayBundle with all required components
+        return RayBundle(origins=origins, directions=directions, pixel_area=pixel_area, camera_indices=camera_indices)
+
+
+
+

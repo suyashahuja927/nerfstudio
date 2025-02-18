@@ -127,25 +127,36 @@ class RaySamples(TensorDataclass):
     """Times at which rays are sampled"""
 
     def get_weights(self, densities: Float[Tensor, "*batch num_samples 1"]) -> Float[Tensor, "*batch num_samples 1"]:
-        """Return weights based on predicted densities
+        """Return weights based on predicted densities.
 
         Args:
-            densities: Predicted densities for samples along ray
+            densities: Predicted densities for samples along ray.
 
         Returns:
-            Weights for each sample
+            Weights for each sample.
         """
+        # Step 1: Compute delta_density
+        delta_density = self.deltas * densities  # [batch, num_samples, 1]
 
-        delta_density = self.deltas * densities
-        alphas = 1 - torch.exp(-delta_density)
+        # Step 2: Compute alphas
+        alphas = 1 - torch.exp(-delta_density)  # [batch, num_samples, 1]
 
-        transmittance = torch.cumsum(delta_density[..., :-1, :], dim=-2)
-        transmittance = torch.cat(
-            [torch.zeros((*transmittance.shape[:1], 1, 1), device=densities.device), transmittance], dim=-2
-        )
-        transmittance = torch.exp(-transmittance)  # [..., "num_samples"]
+        # Step 3: Compute transmittance using cumulative sum
+        transmittance = torch.cumsum(delta_density[..., :-1, :], dim=-2)  # [batch, num_samples-1, 1]
 
-        weights = alphas * transmittance  # [..., "num_samples"]
+        # Step 4: Create a zeros tensor to prepend to transmittance
+        zeros_tensor = torch.zeros_like(transmittance[..., :1, :])  # [batch, 1, 1]
+
+        # Step 5: Concatenate zeros tensor to transmittance
+        transmittance = torch.cat([zeros_tensor, transmittance], dim=-2)  # [batch, num_samples, 1]
+
+        # Step 6: Apply exponential to compute final transmittance
+        transmittance = torch.exp(-transmittance)  # [batch, num_samples, 1]
+
+        # Step 7: Compute weights
+        weights = alphas * transmittance  # [batch, num_samples, 1]
+
+        # Step 8: Handle NaNs, if any
         weights = torch.nan_to_num(weights)
 
         return weights
@@ -264,6 +275,7 @@ class RayBundle(TensorDataclass):
         Returns:
             Samples projected along ray.
         """
+
         deltas = bin_ends - bin_starts
         if self.camera_indices is not None:
             camera_indices = self.camera_indices[..., None]

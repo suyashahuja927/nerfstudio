@@ -115,74 +115,80 @@ class CameraOptimizer(nn.Module):
         self,
         indices: Int[Tensor, "camera_indices"],
     ) -> Float[Tensor, "camera_indices 3 4"]:
-        """Indexing into camera adjustments.
-        Args:
-            indices: indices of Cameras to optimize.
-        Returns:
-            Transformation matrices from optimized camera coordinates
-            to given camera coordinates.
-        """
+        """Indexing into camera adjustments."""
         outputs = []
 
         # Apply learned transformation delta.
         if self.config.mode == "off":
             pass
         elif self.config.mode == "SO3xR3":
-            outputs.append(exp_map_SO3xR3(self.pose_adjustment[indices, :]))
+            print(f"pose_adjustment shape: {self.pose_adjustment.shape}")
+            print(f"indices shape: {indices.shape}")
+
+            # Ensure indices align correctly with pose_adjustment
+            indices_flat = indices.reshape(-1)  # Flatten indices for indexing
+            print(f"indices_flat shape: {indices_flat.shape}")
+
+            pose_subset = self.pose_adjustment[indices_flat, :]  # [num_indices, 6]
+            pose_subset = pose_subset.reshape(-1, 6)  # Ensure 2D tensor
+            print(f"pose_subset shape: {pose_subset.shape}")
+
+            # Compute corrections
+            correction_matrices = exp_map_SO3xR3(pose_subset)  # [num_indices, 3, 4]
+            correction_matrices = correction_matrices.reshape(*indices.shape, 3, 4)  # Match indices shape
+            outputs.append(correction_matrices)
+
         elif self.config.mode == "SE3":
-            outputs.append(exp_map_SE3(self.pose_adjustment[indices, :]))
+            indices_flat = indices.reshape(-1)  # Flatten indices for indexing
+            correction_matrices = exp_map_SE3(self.pose_adjustment[indices_flat, :])  # [num_indices, 3, 4]
+            correction_matrices = correction_matrices.reshape(*indices.shape, 3, 4)  # Match indices shape
+            outputs.append(correction_matrices)
         else:
             assert_never(self.config.mode)
+
         # Detach non-trainable indices by setting to identity transform
         if self.non_trainable_camera_indices is not None:
             if self.non_trainable_camera_indices.device != self.pose_adjustment.device:
                 self.non_trainable_camera_indices = self.non_trainable_camera_indices.to(self.pose_adjustment.device)
-            outputs[0][self.non_trainable_camera_indices] = torch.eye(4, device=self.pose_adjustment.device)[:3, :4]
 
-        # Return: identity if no transforms are needed, otherwise multiply transforms together.
+            for correction_matrix in outputs:
+                correction_matrix[self.non_trainable_camera_indices] = torch.eye(4, device=self.pose_adjustment.device)[
+                    :3, :4
+                ]
+
+        # Return identity if no transforms are needed
         if len(outputs) == 0:
-            # Note that using repeat() instead of tile() here would result in unnecessary copies.
             return torch.eye(4, device=self.device)[None, :3, :4].tile(indices.shape[0], 1, 1)
+
         return functools.reduce(pose_utils.multiply, outputs)
 
     def apply_to_raybundle(self, raybundle: RayBundle) -> None:
-        """Apply the pose correction to the raybundle"""
+        """Apply the pose correction to the raybundle."""
         if self.config.mode != "off":
-            correction_matrices = self(raybundle.camera_indices.squeeze())  # type: ignore
-            raybundle.origins = raybundle.origins + correction_matrices[:, :3, 3]
-            raybundle.directions = torch.bmm(correction_matrices[:, :3, :3], raybundle.directions[..., None]).squeeze()
+            print(f"raybundle.camera_indices shape: {raybundle.camera_indices.shape}")
 
-    def apply_to_camera(self, camera: Cameras) -> torch.Tensor:
-        """Apply the pose correction to the world-to-camera matrix in a Camera object"""
-        if self.config.mode == "off":
-            return camera.camera_to_worlds
+            # Flatten camera indices for processing
+            indices = raybundle.camera_indices.reshape(-1)
+            correction_matrices = self(indices)  # [num_indices, 3, 4]
 
-        if camera.metadata is None or "cam_idx" not in camera.metadata:
-            # Viser cameras
-            return camera.camera_to_worlds
+            # Reshape correction matrices to align with raybundle dimensions
+            correction_matrices = correction_matrices.reshape(*raybundle.origins.shape[:-1], 3, 4)
+            print(f"correction_matrices shape: {correction_matrices.shape}")
 
-        camera_idx = camera.metadata["cam_idx"]
-        adj = self(torch.tensor([camera_idx], dtype=torch.long)).to(camera.device)  # type: ignore
-
-        return torch.cat(
-            [
-                # Apply rotation to directions in world coordinates, without touching the origin.
-                # Equivalent to: directions -> correction[:3,:3] @ directions
-                torch.bmm(adj[..., :3, :3], camera.camera_to_worlds[..., :3, :3]),
-                # Apply translation in world coordinate, independently of rotation.
-                # Equivalent to: origins -> origins + correction[:3,3]
-                camera.camera_to_worlds[..., :3, 3:] + adj[..., :3, 3:],
-            ],
-            dim=-1,
-        )
+            # Apply corrections to raybundle origins and directions
+            raybundle.origins = raybundle.origins + correction_matrices[..., :3, 3]
+            raybundle.directions = torch.einsum(
+                "...ij,...j->...i", correction_matrices[..., :3, :3], raybundle.directions
+            )
 
     def get_loss_dict(self, loss_dict: dict) -> None:
-        """Add regularization"""
+        """Add regularization."""
         if self.config.mode != "off":
             loss_dict["camera_opt_regularizer"] = (
                 self.pose_adjustment[:, :3].norm(dim=-1).mean() * self.config.trans_l2_penalty
                 + self.pose_adjustment[:, 3:].norm(dim=-1).mean() * self.config.rot_l2_penalty
             )
+
 
     def get_correction_matrices(self):
         """Get optimized pose correction matrices"""

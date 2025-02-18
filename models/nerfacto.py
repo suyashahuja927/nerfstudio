@@ -301,6 +301,10 @@ class NerfactoModel(Model):
             self.camera_optimizer.apply_to_raybundle(ray_bundle)
         ray_samples: RaySamples
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        print("ray_samples shape:", ray_samples.shape)
+        print("weights_list shape:", [w.shape for w in weights_list])
+        print("ray_samples_list shape:", [r.shape for r in ray_samples_list])
+
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
         if self.config.use_gradient_scaling:
             field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)

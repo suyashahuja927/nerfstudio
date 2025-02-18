@@ -43,9 +43,7 @@ class DepthDataset(InputDataset):
 
     exclude_batch_keys_from_device = InputDataset.exclude_batch_keys_from_device + ["depth_image"]
 
-    def __init__(
-        self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0, cache_compressed_images: bool = False
-    ):
+    def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0):
         super().__init__(dataparser_outputs, scale_factor)
         # if there are no depth images than we want to generate them all with zoe depth
 
@@ -79,7 +77,7 @@ class DepthDataset(InputDataset):
                     filenames = dataparser_outputs.image_filenames
 
                 repo = "isl-org/ZoeDepth"
-                zoe = torch_compile(torch.hub.load(repo, "ZoeD_NK", pretrained=True).to(device))
+                self.zoe = torch_compile(torch.hub.load(repo, "ZoeD_NK", pretrained=True).to(device))
 
                 for i in track(range(len(filenames)), description="Generating depth images"):
                     image_filename = filenames[i]
@@ -93,7 +91,7 @@ class DepthDataset(InputDataset):
                         image = torch.permute(image, (2, 0, 1)).unsqueeze(0).to(device)
                         if image.shape[1] == 4:
                             image = image[:, :3, :, :]
-                        depth_tensor = zoe.infer(image).squeeze().unsqueeze(-1)
+                        depth_tensor = self.zoe.infer(image).squeeze().unsqueeze(-1)
 
                     depth_tensors.append(depth_tensor)
 

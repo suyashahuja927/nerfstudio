@@ -41,9 +41,11 @@ def get_dict_to_torch(stuff: T, device: Union[torch.device, str] = "cpu", exclud
             if exclude and k in exclude:
                 stuff[k] = v
             else:
+                device = torch.device("cpu")
                 stuff[k] = get_dict_to_torch(v, device)
         return stuff
     if isinstance(stuff, torch.Tensor):
+        device = torch.device("cpu")
         return stuff.to(device)
     return stuff
 
